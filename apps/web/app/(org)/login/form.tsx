@@ -40,6 +40,7 @@ export function LoginForm() {
 	const router = useRouter();
 	const next = searchParams?.get("next");
 	const [email, setEmail] = useState("");
+	const [password, setPassword] = useState("");
 	const [loading, setLoading] = useState(false);
 	const [emailSent, setEmailSent] = useState(false);
 	const [oauthError, setOauthError] = useState(false);
@@ -306,11 +307,9 @@ export function LoginForm() {
 										onSubmit={async (e) => {
 											e.preventDefault();
 
-											const remainingSeconds =
-												getEmailCodeCooldownSeconds(lastEmailSentTime);
-											if (remainingSeconds > 0) {
+											if (password.length < 8) {
 												toast.error(
-													`Please wait ${remainingSeconds} seconds before requesting a new code.`,
+													"Password must be at least 8 characters.",
 												);
 												return;
 											}
@@ -318,25 +317,17 @@ export function LoginForm() {
 											setLoading(true);
 											try {
 												const nextPath = getNextPath();
-												const normalizedEmail = await requestEmailCode({
-													email,
-													next: nextPath,
-													isSignup: false,
-													authSurface: "login",
+												const res = await signIn("credentials", {
+													email: email.trim().toLowerCase(),
+													password,
+													redirect: false,
 												});
-												if (!normalizedEmail) return;
-
-												const sentAt = Date.now();
-												setEmailSent(true);
-												setLastEmailSentTime(sentAt);
-												const params = new URLSearchParams({
-													email: normalizedEmail,
-													...(nextPath && { next: nextPath }),
-													lastSent: sentAt.toString(),
-												});
-												router.push(`/verify-otp?${params.toString()}`);
+												if (res?.ok && !res.error) {
+													router.push(nextPath || "/dashboard");
+												} else {
+													toast.error("Invalid email or password.");
+												}
 											} catch {
-												setEmailSent(false);
 												toast.error(
 													"Sign in is taking longer than expected. Check your connection or browser extensions, then try again.",
 												);
@@ -351,6 +342,8 @@ export function LoginForm() {
 											email={email}
 											emailSent={emailSent}
 											setEmail={setEmail}
+											password={password}
+											setPassword={setPassword}
 											loading={loading}
 											oauthError={oauthError}
 											handleGoogleSignIn={handleGoogleSignIn}
@@ -432,6 +425,8 @@ const NormalLogin = ({
 	email,
 	emailSent,
 	setEmail,
+	password,
+	setPassword,
 	loading,
 	oauthError,
 	handleGoogleSignIn,
@@ -440,12 +435,15 @@ const NormalLogin = ({
 	email: string;
 	emailSent: boolean;
 	setEmail: (email: string) => void;
+	password: string;
+	setPassword: (password: string) => void;
 	loading: boolean;
 	oauthError: boolean;
 	handleGoogleSignIn: () => void;
 }) => {
 	const publicEnv = usePublicEnv();
 	const emailInputId = useId();
+	const passwordInputId = useId();
 
 	return (
 		<motion.div>
@@ -464,6 +462,19 @@ const NormalLogin = ({
 						setEmail(e.target.value.toLowerCase());
 					}}
 				/>
+				<MotionInput
+					id={passwordInputId}
+					name="password"
+					type="password"
+					placeholder="Password"
+					autoComplete="current-password"
+					required
+					value={password}
+					disabled={loading}
+					onChange={(e) => {
+						setPassword(e.target.value);
+					}}
+				/>
 				<MotionButton
 					variant="dark"
 					type="submit"
@@ -475,7 +486,7 @@ const NormalLogin = ({
 						)
 					}
 				>
-					{loading ? "Sending code..." : "Login with email"}
+					{loading ? "Signing in..." : "Sign in"}
 				</MotionButton>
 				{/* {NODE_ENV === "development" && (
                   <div className="flex justify-center items-center px-6 py-3 mt-3 bg-red-600 rounded-xl">
