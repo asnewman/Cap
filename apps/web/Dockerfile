@@ -6,7 +6,9 @@ WORKDIR /app
 COPY . .
 
 RUN corepack enable pnpm
-RUN pnpm i --frozen-lockfile
+# ponytail: --no-frozen instead of --frozen because Cap's main has an
+# overrides/lockfile drift; upgrade path is to regen pnpm-lock.yaml upstream.
+RUN pnpm i --no-frozen-lockfile
 
 ARG NEXT_PUBLIC_DOCKER_BUILD=true
 ENV NEXT_PUBLIC_WEB_URL=http://localhost:3000
