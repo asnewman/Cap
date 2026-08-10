@@ -75,7 +75,7 @@ export async function transcribeVideoWorkflow(
 		}
 
 		const [transcription] = await Promise.all([
-			transcribeWithDeepgram(audioUrl, videoData.aiGenerationLanguage),
+			transcribeWithAssemblyAI(audioUrl, videoData.aiGenerationLanguage),
 		]);
 
 		await saveTranscription(videoId, userId, videoData.video, transcription);
@@ -97,8 +97,8 @@ export async function transcribeVideoWorkflow(
 async function validateVideo(videoId: string): Promise<VideoData> {
 	"use step";
 
-	if (!serverEnv().DEEPGRAM_API_KEY) {
-		throw new FatalError("Missing DEEPGRAM_API_KEY");
+	if (!serverEnv().ASSEMBLY_API_KEY) {
+		throw new FatalError("Missing ASSEMBLY_API_KEY");
 	}
 
 	const query = await db()
@@ -348,6 +348,101 @@ async function transcribeWithDeepgram(
 	}
 
 	return formatToWebVTT(result as unknown as DeepgramResult);
+}
+
+async function transcribeWithAssemblyAI(
+	audioUrl: string,
+	language: AiGenerationLanguage,
+): Promise<string> {
+	"use step";
+
+	const apiKey = serverEnv().ASSEMBLY_API_KEY as string;
+	const base = "https://api.assemblyai.com/v2";
+	const authHeader = { authorization: apiKey };
+
+	const audioResponse = await fetch(audioUrl);
+	if (!audioResponse.ok) {
+		throw new Error(
+			`Audio URL not accessible: ${audioResponse.status} ${audioResponse.statusText}`,
+		);
+	}
+	const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+
+	// 1. Upload the extracted audio to AssemblyAI.
+	const uploadResponse = await fetch(`${base}/upload`, {
+		method: "POST",
+		headers: { ...authHeader, "content-type": "application/octet-stream" },
+		body: audioBuffer,
+	});
+	if (!uploadResponse.ok) {
+		throw new Error(
+			`AssemblyAI upload failed: ${uploadResponse.status} ${await uploadResponse.text()}`,
+		);
+	}
+	const { upload_url: uploadUrl } = (await uploadResponse.json()) as {
+		upload_url: string;
+	};
+
+	// 2. Kick off the transcription job.
+	const createBody: Record<string, unknown> = { audio_url: uploadUrl };
+	if (language === AI_GENERATION_LANGUAGE_AUTO) {
+		createBody.language_detection = true;
+	} else {
+		createBody.language_code = language;
+	}
+
+	const createResponse = await fetch(`${base}/transcript`, {
+		method: "POST",
+		headers: { ...authHeader, "content-type": "application/json" },
+		body: JSON.stringify(createBody),
+	});
+	if (!createResponse.ok) {
+		throw new Error(
+			`AssemblyAI transcript request failed (language=${language}): ${createResponse.status} ${await createResponse.text()}`,
+		);
+	}
+	const { id: transcriptId } = (await createResponse.json()) as { id: string };
+
+	// 3. Poll until the job finishes (short clips complete well under a minute).
+	const deadline = Date.now() + 10 * 60 * 1000;
+	while (Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 3000));
+
+		const pollResponse = await fetch(`${base}/transcript/${transcriptId}`, {
+			headers: authHeader,
+		});
+		if (!pollResponse.ok) {
+			throw new Error(
+				`AssemblyAI polling failed: ${pollResponse.status} ${await pollResponse.text()}`,
+			);
+		}
+		const poll = (await pollResponse.json()) as {
+			status: string;
+			error?: string;
+		};
+
+		if (poll.status === "completed") {
+			// 4. Export the transcript as WebVTT (what Cap stores + renders).
+			const vttResponse = await fetch(
+				`${base}/transcript/${transcriptId}/vtt`,
+				{ headers: authHeader },
+			);
+			if (!vttResponse.ok) {
+				throw new Error(
+					`AssemblyAI VTT export failed: ${vttResponse.status} ${await vttResponse.text()}`,
+				);
+			}
+			return await vttResponse.text();
+		}
+
+		if (poll.status === "error") {
+			throw new Error(
+				`AssemblyAI transcription failed (language=${language}): ${poll.error}`,
+			);
+		}
+	}
+
+	throw new Error("AssemblyAI transcription timed out");
 }
 
 const DEEPGRAM_DETECTABLE_LANGUAGES = [

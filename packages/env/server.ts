@@ -87,6 +87,7 @@ function createServerEnv() {
 
 			/// AI providers
 			DEEPGRAM_API_KEY: z.string().optional().describe("Audio transcription"),
+			ASSEMBLY_API_KEY: z.string().optional().describe("Audio transcription"),
 			ANTHROPIC_API_KEY: z.string().optional().describe("AI chat"),
 			OPENAI_API_KEY: z.string().optional().describe("AI summaries"),
 			GROQ_API_KEY: z.string().optional().describe("AI summaries"),
