@@ -16,7 +16,7 @@ import {
 import { type ImageUpload, Organisation } from "@cap/web-domain";
 import { useMutation } from "@tanstack/react-query";
 import { Effect, Option } from "effect";
-import { LogOut } from "lucide-react";
+import { KeyRound, LogOut } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { signOut } from "next-auth/react";
 import { useEffect, useId, useState } from "react";
@@ -26,7 +26,11 @@ import { SignedImageUrl } from "@/components/SignedImageUrl";
 import { useEffectMutation, useRpcClient } from "@/lib/EffectRuntime";
 import { useDashboardContext } from "../../Contexts";
 import { ProfileImage } from "./components/ProfileImage";
-import { patchAccountSettings, signOutAllDevices } from "./server";
+import {
+	changePassword,
+	patchAccountSettings,
+	signOutAllDevices,
+} from "./server";
 
 export const Settings = () => {
 	const router = useRouter();
@@ -40,6 +44,8 @@ export const Settings = () => {
 	const firstNameId = useId();
 	const lastNameId = useId();
 	const contactEmailId = useId();
+	const newPasswordId = useId();
+	const [newPassword, setNewPassword] = useState("");
 	const initialProfileImage = user?.imageUrl ?? null;
 	const [profileImageOverride, setProfileImageOverride] = useState<
 		ImageUpload.ImageUrl | null | undefined
@@ -91,6 +97,17 @@ export const Settings = () => {
 		},
 		onError: () => {
 			toast.error("Failed to sign out of all devices");
+		},
+	});
+
+	const changePasswordMutation = useMutation({
+		mutationFn: () => changePassword(newPassword),
+		onSuccess: () => {
+			toast.success("Password updated");
+			setNewPassword("");
+		},
+		onError: () => {
+			toast.error("Failed to update password");
 		},
 	});
 
@@ -289,6 +306,51 @@ export const Settings = () => {
 				>
 					{updateNamePending ? "Saving..." : "Save"}
 				</Button>
+			</form>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault();
+					if (newPassword.length < 8) {
+						toast.error("Password must be at least 8 characters.");
+						return;
+					}
+					changePasswordMutation.mutate();
+				}}
+			>
+				<Card className="flex flex-col gap-4 mt-6">
+					<div className="space-y-1">
+						<CardTitle>Change password</CardTitle>
+						<CardDescription>
+							Set a new password for signing in with your email address.
+						</CardDescription>
+					</div>
+					<div className="flex flex-col gap-3 md:flex-row md:items-center">
+						<Input
+							type="password"
+							placeholder="New password"
+							autoComplete="new-password"
+							minLength={8}
+							value={newPassword}
+							onChange={(e) => setNewPassword(e.target.value)}
+							id={newPasswordId}
+							name="newPassword"
+							aria-label="New password"
+							className="md:max-w-sm"
+						/>
+						<Button
+							type="submit"
+							size="sm"
+							variant="dark"
+							icon={<KeyRound className="size-4" />}
+							disabled={!newPassword || changePasswordMutation.isPending}
+							spinner={changePasswordMutation.isPending}
+						>
+							{changePasswordMutation.isPending
+								? "Updating..."
+								: "Update password"}
+						</Button>
+					</div>
+				</Card>
 			</form>
 			<Card className="flex flex-col gap-4 mt-6 md:flex-row md:items-center md:justify-between">
 				<div className="space-y-1">

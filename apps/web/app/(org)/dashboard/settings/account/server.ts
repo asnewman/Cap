@@ -1,6 +1,7 @@
 "use server";
 
 import { db } from "@cap/database";
+import { hashPassword, MIN_PASSWORD_LENGTH } from "@cap/database/auth/password";
 import { getCurrentUser } from "@cap/database/auth/session";
 import { nanoId } from "@cap/database/helpers";
 import {
@@ -87,6 +88,25 @@ export async function patchAccountSettings(
 		.where(eq(users.id, currentUser.id));
 
 	revalidatePath("/dashboard/settings/account");
+}
+
+export async function changePassword(newPassword: string) {
+	const currentUser = await getCurrentUser();
+	if (!currentUser) throw new Error("Unauthorized");
+
+	if (
+		typeof newPassword !== "string" ||
+		newPassword.length < MIN_PASSWORD_LENGTH
+	) {
+		throw new Error(
+			`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`,
+		);
+	}
+
+	await db()
+		.update(users)
+		.set({ password: await hashPassword(newPassword) })
+		.where(eq(users.id, currentUser.id));
 }
 
 export async function listCliApiKeys(): Promise<CliApiKeySummary[]> {

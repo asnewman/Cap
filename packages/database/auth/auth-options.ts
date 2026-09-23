@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import { promisify } from "node:util";
 import { serverEnv } from "@cap/env";
 import { User } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -23,6 +22,11 @@ import {
 } from "./domain-utils.ts";
 import { DrizzleAdapter } from "./drizzle-adapter.ts";
 import {
+	hashPassword,
+	MIN_PASSWORD_LENGTH,
+	verifyPassword,
+} from "./password.ts";
+import {
 	provisionSsoMembership,
 	type SsoAuthContext,
 	type ValidatedSsoIdentity,
@@ -33,31 +37,6 @@ import { ssoLoginErrorPath } from "./sso-state.ts";
 export const maxDuration = 120;
 
 const OTP_CODE_MAX_AGE_SECONDS = 10 * 60;
-
-// Password hashing via Node's built-in scrypt (salted, memory-hard KDF) — no
-// extra dependency, keeps the frozen-lockfile Docker build intact. Stored as
-// "salt:derivedKey" in hex.
-const scryptAsync = promisify(crypto.scrypt);
-
-async function hashPassword(password: string): Promise<string> {
-	const salt = crypto.randomBytes(16).toString("hex");
-	const derived = (await scryptAsync(password, salt, 64)) as Buffer;
-	return `${salt}:${derived.toString("hex")}`;
-}
-
-async function verifyPassword(
-	password: string,
-	stored: string,
-): Promise<boolean> {
-	const [salt, key] = stored.split(":");
-	if (!salt || !key) return false;
-	const keyBuffer = Buffer.from(key, "hex");
-	const derived = (await scryptAsync(password, salt, 64)) as Buffer;
-	return (
-		keyBuffer.length === derived.length &&
-		crypto.timingSafeEqual(keyBuffer, derived)
-	);
-}
 
 export async function decodeSessionToken(
 	params: JWTDecodeParams,
@@ -135,7 +114,7 @@ export const authOptions = (ssoContext?: SsoAuthContext): NextAuthOptions => {
 					async authorize(credentials) {
 						const email = credentials?.email?.trim().toLowerCase();
 						const password = credentials?.password ?? "";
-						if (!email || password.length < 8) return null;
+						if (!email || password.length < MIN_PASSWORD_LENGTH) return null;
 
 						const [existing] = await db()
 							.select()

@@ -60,6 +60,7 @@
 		".": "./index.ts",
 		"./auth/auth-options": "./auth/auth-options.ts",
 		"./auth/domain-utils": "./auth/domain-utils.ts",
+		"./auth/password": "./auth/password.ts",
 		"./auth/session": "./auth/session.ts",
 		"./auth/sso": "./auth/sso.ts",
 		"./auth/sso-state": "./auth/sso-state.ts",
