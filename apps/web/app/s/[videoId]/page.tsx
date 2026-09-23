@@ -29,7 +29,7 @@ import {
 	Comment,
 	type ImageUpload,
 	type Organisation,
-	Policy,
+	type Policy,
 	type Video,
 } from "@cap/web-domain";
 import { and, eq, type InferSelectModel, isNull, sql } from "drizzle-orm";
@@ -40,9 +40,11 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getVideoAnalytics } from "@/actions/videos/get-analytics";
 import {
-	getDashboardData,
+	getDashboardSpacesData,
 	type OrganizationSettings,
+	type Spaces,
 } from "@/app/(org)/dashboard/dashboard-data";
+import { isAiConfigured } from "@/lib/ai/provider";
 import { completeDesktopSegmentsManifestAndQueue } from "@/lib/desktop-segments-recovery";
 import { createNotification } from "@/lib/Notification";
 import {
@@ -54,7 +56,10 @@ import { getPublicShareVideo } from "@/lib/public-share-video";
 import * as EffectRuntime from "@/lib/server";
 import { runPromise } from "@/lib/server";
 import { getSharePageBranding } from "@/lib/share-branding";
+import { getSharePlaybackUrl } from "@/lib/share-playback";
 import { buildShareVideoMetadata } from "@/lib/share-video-metadata";
+import { resolveShareWebUrl } from "@/lib/share-web-url";
+import { isVideoOverShareableLinkLimit } from "@/lib/shareable-link-quota";
 import {
 	isIframelyCrawlerUserAgent,
 	isSocialCrawlerUserAgent,
@@ -62,10 +67,7 @@ import {
 } from "@/lib/social-crawlers";
 import { transcribeVideo } from "@/lib/transcribe";
 import { canUserDownloadVideo } from "@/lib/video-download-permissions";
-import {
-	isEditSourceKey,
-	reconcileStaleEditUpload,
-} from "@/lib/video-edit-processing";
+import { isEditSourceKey } from "@/lib/video-edit-processing";
 import {
 	areEditSpecsEquivalent,
 	createIdentityEditSpec,
@@ -94,6 +96,22 @@ const hasRecordingStoppedParam = (searchParams: ShareVideoSearchParams) => {
 
 	return recordingStoppedParam === "1" || recordingStoppedParam === "true";
 };
+
+function toShareVideo<
+	T extends {
+		password: unknown;
+		ownerId: unknown;
+		organizationTombstoneAt: Date | null;
+	},
+>(row: T) {
+	const {
+		password: _password,
+		ownerId: _ownerId,
+		organizationTombstoneAt: _organizationTombstoneAt,
+		...video
+	} = row;
+	return video;
+}
 
 // Helper function to fetch shared spaces data for a video
 async function getSharedSpacesForVideo(videoId: Video.VideoId) {
@@ -160,7 +178,10 @@ async function getSharedSpacesForVideo(videoId: Video.VideoId) {
 		});
 	});
 
-	return sharedSpaces;
+	return {
+		sharedSpaces,
+		sharedOrganizations: orgSharing.map(({ id, name }) => ({ id, name })),
+	};
 }
 
 function PolicyDeniedView({ reason }: { reason?: string }) {
@@ -234,6 +255,13 @@ export async function generateMetadata(
 	const shouldAdvertiseIframelyPlayer =
 		isIframelyCrawlerUserAgent(requestUserAgent) &&
 		(await getPublicShareVideo(videoId).catch(() => null)) !== null;
+	// Share pages also serve verified custom domains. Metadata has to point at
+	// the host the visitor used, or Slack drops the preview image.
+	const webUrl = await resolveShareWebUrl(headersList);
+	const ogImageUrl = new URL(
+		`/api/video/og?videoId=${videoId}`,
+		webUrl,
+	).toString();
 
 	return Effect.flatMap(Videos, (v) => v.getByIdForViewing(videoId)).pipe(
 		Effect.map(
@@ -252,7 +280,8 @@ export async function generateMetadata(
 							videoId,
 							name: video.name,
 							sourceType: video.source.type,
-							webUrl: buildEnv.NEXT_PUBLIC_WEB_URL,
+							webUrl,
+							canonicalWebUrl: buildEnv.NEXT_PUBLIC_WEB_URL,
 							advertiseIframelyPlayer: shouldAdvertiseIframelyPlayer,
 						}),
 						robots: canRenderSocialPreview
@@ -268,16 +297,7 @@ export async function generateMetadata(
 					title: "Cap: This video is restricted",
 					description: "This video has restricted access.",
 					openGraph: {
-						images: [
-							{
-								url: new URL(
-									`/api/video/og?videoId=${videoId}`,
-									buildEnv.NEXT_PUBLIC_WEB_URL,
-								).toString(),
-								width: 1200,
-								height: 630,
-							},
-						],
+						images: [{ url: ogImageUrl, width: 1200, height: 630 }],
 					},
 					robots: "noindex, nofollow",
 				}),
@@ -286,27 +306,13 @@ export async function generateMetadata(
 					title: "Cap: Password Protected Video",
 					description: "This video is password protected.",
 					openGraph: {
-						images: [
-							{
-								url: new URL(
-									`/api/video/og?videoId=${videoId}`,
-									buildEnv.NEXT_PUBLIC_WEB_URL,
-								).toString(),
-								width: 1200,
-								height: 630,
-							},
-						],
+						images: [{ url: ogImageUrl, width: 1200, height: 630 }],
 					},
 					twitter: {
 						card: "summary_large_image",
 						title: "Cap: Password Protected Video",
 						description: "This video is password protected.",
-						images: [
-							new URL(
-								`/api/video/og?videoId=${videoId}`,
-								buildEnv.NEXT_PUBLIC_WEB_URL,
-							).toString(),
-						],
+						images: [ogImageUrl],
 					},
 					robots: "noindex, nofollow",
 				}),
@@ -323,12 +329,9 @@ export default async function ShareVideoPage(props: PageProps<"/s/[videoId]">) {
 	const awaitRecording =
 		isValidVideoIdParam(videoId) && hasRecordingStoppedParam(searchParams);
 
-	await reconcileStaleEditUpload(videoId);
-
 	return Effect.gen(function* () {
 		const videosPolicy = yield* VideosPolicy;
-
-		const [video] = yield* Effect.promise(() =>
+		const loadVideo = () =>
 			db()
 				.select({
 					id: videos.id,
@@ -372,16 +375,25 @@ export default async function ShareVideoPage(props: PageProps<"/s/[videoId]">) {
 						),
 					activeUploadRawFileKey: videoUploads.rawFileKey,
 					owner: users,
+					ownerId: videos.ownerId,
+					password: videos.password,
+					organizationTombstoneAt: organizations.tombstoneAt,
 				})
 				.from(videos)
 				.leftJoin(sharedVideos, eq(videos.id, sharedVideos.videoId))
 				.innerJoin(users, eq(videos.ownerId, users.id))
 				.leftJoin(videoUploads, eq(videos.id, videoUploads.videoId))
 				.leftJoin(organizations, eq(videos.orgId, organizations.id))
-				.where(and(eq(videos.id, videoId), isNull(organizations.tombstoneAt))),
-		).pipe(Policy.withPublicPolicy(videosPolicy.canView(videoId)));
+				.where(eq(videos.id, videoId));
+		const [row] = yield* Effect.promise(loadVideo);
 
-		return Option.fromNullable(video);
+		if (row) {
+			yield* videosPolicy.canViewLoaded(row, Option.fromNullable(row.password));
+		}
+
+		return Option.fromNullable(
+			row && row.organizationTombstoneAt === null ? toShareVideo(row) : null,
+		);
 	}).pipe(
 		Effect.flatten,
 		Effect.map((video) => ({ needsPassword: false, video }) as const),
@@ -451,7 +463,9 @@ async function AuthorizedContent({
 				userId: user.id,
 			});
 			recoveredDesktopSegmentsUpload =
-				result.status === "queued" || result.status === "already-processing";
+				result.status === "queued" ||
+				result.status === "already-processing" ||
+				result.status === "source-committing";
 		} catch (error) {
 			console.error(
 				`[ShareVideoPage] Failed to recover desktop segments upload ${videoId}:`,
@@ -466,17 +480,16 @@ async function AuthorizedContent({
 		!hasActiveUpload &&
 		Date.now() - video.updatedAt.getTime() >= VIEW_NOTIFICATION_DELAY_MS;
 
-	if (user && video && user.id !== video.owner.id && canRegisterView) {
-		try {
-			await createNotification({
-				type: "view",
-				videoId: video.id,
-				authorId: user.id,
-			});
-		} catch (error) {
-			console.warn("Failed to create view notification:", error);
-		}
-	}
+	const viewNotificationPromise =
+		user && user.id !== video.owner.id && canRegisterView
+			? createNotification({
+					type: "view",
+					videoId: video.id,
+					authorId: user.id,
+				}).catch((error) => {
+					console.warn("Failed to create view notification:", error);
+				})
+			: Promise.resolve();
 
 	const userId = user?.id;
 	const commentId = optionFromTOrFirst(searchParams.comment).pipe(
@@ -490,35 +503,56 @@ async function AuthorizedContent({
 	// Everything below is an independent round trip (DB or storage); each is
 	// started here and awaited together further down, so the page pays for the
 	// slowest one instead of the sum of all of them.
-	const spacesDataPromise: Promise<
-		Awaited<ReturnType<typeof getDashboardData>>["spacesData"] | null
-	> = user
-		? getDashboardData(user).then(
-				(dashboardData) => dashboardData.spacesData,
-				(error) => {
-					console.error(
-						"Failed to fetch spaces data for sharing dialog:",
-						error,
-					);
-					return [];
-				},
-			)
+	const spacesDataPromise: Promise<Spaces[] | null> = user
+		? getDashboardSpacesData(user).catch((error) => {
+				console.error("Failed to fetch spaces data for sharing dialog:", error);
+				return [];
+			})
 		: Promise.resolve(null);
 
 	const sharedSpacesPromise = getSharedSpacesForVideo(videoId);
 
-	const aiGenerationEnabledPromise = db()
-		.select({
-			email: users.email,
-			stripeSubscriptionStatus: users.stripeSubscriptionStatus,
-			thirdPartyStripeSubscriptionId: users.thirdPartyStripeSubscriptionId,
-		})
-		.from(users)
-		.where(eq(users.id, video.owner.id))
-		.limit(1)
-		.then((videoOwnerQuery) =>
-			videoOwnerQuery[0] ? isAiGenerationEnabled(videoOwnerQuery[0]) : false,
+	const ownerIsPro = userIsPro(video.owner);
+
+	// Fail-open: a broken count must never take the share page down.
+	const overShareLimitPromise = ownerIsPro
+		? Promise.resolve(false)
+		: isVideoOverShareableLinkLimit({
+				id: videoId,
+				ownerId: video.owner.id,
+				createdAt: video.createdAt,
+				isScreenshot: video.isScreenshot,
+			}).catch((error) => {
+				console.error(
+					`[ShareVideoPage] Shareable link quota check failed for ${videoId}:`,
+					error,
+				);
+				return false;
+			});
+	const initialPlaybackUrlPromise =
+		!video.isScreenshot &&
+		!hasActiveUpload &&
+		(video.source.type === "desktopMP4" || video.source.type === "webMP4")
+			? overShareLimitPromise.then((overLimit) =>
+					overLimit ? null : getSharePlaybackUrl(video),
+				)
+			: undefined;
+
+	const aiGenerationEnabledPromise = isAiGenerationEnabled(video.owner);
+	const imagesPromise = Effect.gen(function* () {
+		const imageUploads = yield* ImageUploads;
+		const resolveImage = (
+			image: ImageUpload.ImageUrlOrKey | null | undefined,
+		) => (image ? imageUploads.resolveImageUrl(image) : Effect.succeed(null));
+		return yield* Effect.all(
+			{
+				owner: resolveImage(video.owner.image),
+				organization: resolveImage(video.organizationIconUrl),
+				shareableLink: resolveImage(video.shareableLinkIconUrl),
+			},
+			{ concurrency: 3 },
 		);
+	}).pipe(runPromise);
 
 	const screenshotImageUrlPromise = video.isScreenshot
 		? Effect.flatMap(Videos, (videos) => videos.getThumbnailURL(videoId)).pipe(
@@ -528,7 +562,7 @@ async function AuthorizedContent({
 		: Promise.resolve(null);
 
 	const customDomainPromise = (async () => {
-		if (!user) {
+		if (!user || user.id !== video.owner.id) {
 			return { customDomain: null, domainVerified: false };
 		}
 		const activeOrganizationId = user.activeOrganizationId;
@@ -556,12 +590,6 @@ async function AuthorizedContent({
 		}
 		return { customDomain: null, domainVerified: false };
 	})();
-
-	const sharedOrganizationsPromise = db()
-		.select({ id: sharedVideos.organizationId, name: organizations.name })
-		.from(sharedVideos)
-		.innerJoin(organizations, eq(sharedVideos.organizationId, organizations.id))
-		.where(eq(sharedVideos.videoId, videoId));
 
 	const userOrganizationsPromise = (async () => {
 		if (!userId) return [];
@@ -740,16 +768,17 @@ async function AuthorizedContent({
 
 	const [
 		spacesData,
-		sharedSpaces,
+		{ sharedSpaces, sharedOrganizations },
 		aiGenerationEnabled,
 		screenshotImageUrl,
 		membersList,
 		userOrganizations,
-		sharedOrganizations,
 		{ customDomain, domainVerified },
 		canManageSharePageBranding,
 		canDownloadVideo,
 		videoHasEdits,
+		ownerIsOverShareLimit,
+		resolvedImages,
 	] = await Promise.all([
 		spacesDataPromise,
 		sharedSpacesPromise,
@@ -757,11 +786,13 @@ async function AuthorizedContent({
 		screenshotImageUrlPromise,
 		membersListPromise,
 		userOrganizationsPromise,
-		sharedOrganizationsPromise,
 		customDomainPromise,
 		canManageSharePageBrandingPromise,
 		canDownloadVideoPromise,
 		videoHasEditsPromise,
+		overShareLimitPromise,
+		imagesPromise,
+		viewNotificationPromise,
 	]);
 
 	const rules = resolveEffectiveVideoRules({
@@ -774,7 +805,7 @@ async function AuthorizedContent({
 		!video.isScreenshot &&
 		Boolean(env.ASSEMBLY_API_KEY) &&
 		!rules.settings.disableTranscript;
-	const aiProviderAvailable = Boolean(env.GROQ_API_KEY || env.OPENAI_API_KEY);
+	const aiProviderAvailable = isAiConfigured();
 
 	if (
 		transcriptionGenerationAvailable &&
@@ -806,41 +837,32 @@ async function AuthorizedContent({
 		aiGenerationStatus,
 	};
 
-	const videoWithOrganizationInfo = await Effect.gen(function* () {
-		const imageUploads = yield* ImageUploads;
-
-		return {
-			...video,
-			hasActiveUpload,
-			owner: {
-				id: video.owner.id,
-				name: video.owner.name,
-				isPro: userIsPro(video.owner),
-				image: video.owner.image
-					? yield* imageUploads.resolveImageUrl(video.owner.image)
-					: null,
-			},
-			organization: {
-				organizationMembers: membersList.map((member) => member.userId),
-				organizationId: video.sharedOrganization?.organizationId ?? undefined,
-			},
-			sharedOrganizations: sharedOrganizations,
-			password: null,
-			folderId: null,
-			orgSettings: video.orgSettings || null,
-			organizationName: video.organizationName,
-			organizationIconUrl: video.organizationIconUrl
-				? yield* imageUploads.resolveImageUrl(video.organizationIconUrl)
-				: null,
-			shareableLinkIconUrl: video.shareableLinkIconUrl
-				? yield* imageUploads.resolveImageUrl(video.shareableLinkIconUrl)
-				: null,
-			settings: rules.settings,
-			hasInheritedPassword: rules.hasInheritedPassword,
-			inheritedPasswordSources: rules.inheritedPasswordSources,
-			inheritedSpaceSettings: rules.inheritedSettings,
-		};
-	}).pipe(runPromise);
+	const videoWithOrganizationInfo = {
+		...video,
+		hasActiveUpload,
+		ownerIsOverShareLimit,
+		owner: {
+			id: video.owner.id,
+			name: video.owner.name,
+			isPro: ownerIsPro,
+			image: resolvedImages.owner,
+		},
+		organization: {
+			organizationMembers: membersList.map((member) => member.userId),
+			organizationId: video.sharedOrganization?.organizationId ?? undefined,
+		},
+		sharedOrganizations: sharedOrganizations,
+		password: null,
+		folderId: null,
+		orgSettings: video.orgSettings || null,
+		organizationName: video.organizationName,
+		organizationIconUrl: resolvedImages.organization,
+		shareableLinkIconUrl: resolvedImages.shareableLink,
+		settings: rules.settings,
+		hasInheritedPassword: rules.hasInheritedPassword,
+		inheritedPasswordSources: rules.inheritedPasswordSources,
+		inheritedSpaceSettings: rules.inheritedSettings,
+	};
 	const isEditProcessing =
 		isEditSourceKey({
 			ownerId: video.owner.id,
@@ -897,6 +919,7 @@ async function AuthorizedContent({
 					/>
 				}
 				data={videoWithOrganizationInfo}
+				initialPlaybackUrl={initialPlaybackUrlPromise}
 				screenshotImageUrl={screenshotImageUrl}
 				videoSettings={videoWithOrganizationInfo.settings}
 				comments={commentsPromise}

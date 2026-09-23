@@ -1,19 +1,20 @@
+FROM oven/bun:1.4.0-alpine AS bun
+
 FROM node:24-alpine AS base
-RUN corepack enable
 
 FROM base AS builder
 WORKDIR /app
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY . .
 
-RUN corepack enable pnpm
-# ponytail: --no-frozen instead of --frozen because Cap's main has an
-# overrides/lockfile drift; upgrade path is to regen pnpm-lock.yaml upstream.
-RUN pnpm i --no-frozen-lockfile
+# Railway's Metal builder rejects the `# syntax=` BuildKit frontend directive and
+# `--mount=type=cache`, so those are dropped here vs upstream; plain bun install.
+RUN bun install
 
 ARG NEXT_PUBLIC_DOCKER_BUILD=true
 ENV NEXT_PUBLIC_WEB_URL=http://localhost:3000
 
-RUN pnpm run build:web
+RUN bun run build:web
 
 
 # 3. Production image, copy all the files and run next

@@ -184,6 +184,7 @@ type TranscriptionStatus =
 
 interface ShareProps {
 	data: VideoData;
+	initialPlaybackUrl?: Promise<string | null>;
 	comments: MaybePromise<CommentWithAuthor[]>;
 	views: MaybePromise<number>;
 	screenshotImageUrl?: string | null;
@@ -319,6 +320,7 @@ const useVideoStatus = (
 
 export const Share = ({
 	data,
+	initialPlaybackUrl,
 	comments,
 	views,
 	screenshotImageUrl,
@@ -463,6 +465,7 @@ export const Share = ({
 	const initialSeekDone = useRef(false);
 
 	useEffect(() => {
+		if (data.source.type === "desktopSegments") return;
 		if (!searchParams.has("recordingStopped")) return;
 
 		const url = new URL(window.location.href);
@@ -472,7 +475,7 @@ export const Share = ({
 			"",
 			`${url.pathname}${url.search}${url.hash}`,
 		);
-	}, [searchParams]);
+	}, [data.source.type, searchParams]);
 
 	const handleSeek = useCallback((time: number) => {
 		const v =
@@ -598,8 +601,12 @@ export const Share = ({
 	const [selectedView, setSelectedView] = useState<ShareView>(initialView);
 	// Screenshots have no timeline to show, and a comments-disabled video has
 	// nothing to branch — both stay on the classic layout even if someone
-	// hand-writes `?view=timeline`.
-	const timelineAvailable = !isScreenshot && !areCommentStampsDisabled;
+	// hand-writes `?view=timeline`. Over-quota videos stay classic too: the
+	// timeline deck's filmstrip would leak frames below the upgrade gate.
+	const timelineAvailable =
+		!isScreenshot &&
+		!areCommentStampsDisabled &&
+		data.ownerIsOverShareLimit !== true;
 
 	// Where the timeline's filmstrip frames come from. Mirrors the source split
 	// in `ShareVideo`: instant recordings have a result.mp4 a bare <video> can
@@ -954,6 +961,7 @@ export const Share = ({
 													/>
 												) : (
 													<ShareVideo
+														initialPlaybackUrl={initialPlaybackUrl}
 														data={shareVideoData}
 														comments={comments}
 														areChaptersDisabled={areChaptersDisabled}
@@ -988,6 +996,7 @@ export const Share = ({
 														isEditProcessing={isEditProcessing}
 														recordingStopped={recordingStopped}
 														defaultPlaybackSpeed={defaultPlaybackSpeed}
+														viewerIsOwner={viewerId === data.owner.id}
 														ref={playerRef}
 													/>
 												)}

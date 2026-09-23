@@ -23,14 +23,14 @@ import { Tooltip } from "@/components/Tooltip";
 import { isRetryableDesktopSegmentsFinalizationError } from "@/lib/desktop-segments-retryable-errors";
 import type { VideoData } from "../types";
 import { type CaptionLanguage, useCaptionContext } from "./CaptionContext";
-import { scheduleReadyRefresh } from "./deferred-ready-refresh";
 import {
 	PreparingVideoOverlay,
 	RecordingInProgressOverlay,
 } from "./RecordingInProgress";
+import { ShareableLinkLimitOverlay } from "./ShareableLinkLimitOverlay";
 import {
+	isRecordingUpload,
 	shouldDeferPlaybackSource,
-	shouldReloadPlaybackAfterUploadCompletes,
 	type UploadProgress,
 } from "./upload-progress";
 import { formatChaptersAsVTT } from "./utils/transcript-utils";
@@ -79,6 +79,7 @@ export const ShareVideo = forwardRef<
 		data: VideoData & {
 			hasActiveUpload?: boolean;
 		};
+		initialPlaybackUrl?: Promise<string | null>;
 		comments: MaybePromise<CommentWithAuthor[]>;
 		chapters?: { title: string; start: number }[];
 		areChaptersDisabled?: boolean;
@@ -96,11 +97,13 @@ export const ShareVideo = forwardRef<
 		isEditProcessing: boolean;
 		recordingStopped?: boolean;
 		defaultPlaybackSpeed?: number;
+		viewerIsOwner?: boolean;
 	}
 >(
 	(
 		{
 			data,
+			initialPlaybackUrl,
 			comments,
 			chapters = NO_CHAPTERS,
 			areCaptionsDisabled,
@@ -115,6 +118,7 @@ export const ShareVideo = forwardRef<
 			isEditProcessing,
 			recordingStopped = false,
 			defaultPlaybackSpeed,
+			viewerIsOwner = false,
 		},
 		ref,
 	) => {
@@ -144,12 +148,15 @@ export const ShareVideo = forwardRef<
 		const [commentsData, setCommentsData] = useState<CommentWithAuthor[]>([]);
 		const [userConfirmedStopped, setUserConfirmedStopped] =
 			useState(recordingStopped);
+		const handleSourceComplete = useCallback(
+			() => setUserConfirmedStopped(true),
+			[],
+		);
 		const [isConfirmingStopped, setIsConfirmingStopped] = useState(false);
 		const [confirmStoppedError, setConfirmStoppedError] = useState<
 			string | null
 		>(null);
 		const autoFinalizeAttemptedRef = useRef(false);
-		const pendingReadyRefreshRef = useRef(false);
 		// Mirrors what `useUploadProgress(id, enabled)` returned inline: null when
 		// idle, "fetching" from the first enabled render. The hook itself now lives
 		// in the lazily-mounted tracker so finished videos skip its Effect chunk.
@@ -324,13 +331,11 @@ export const ShareVideo = forwardRef<
 		const isMp4Source =
 			data.source.type === "desktopMP4" || data.source.type === "webMP4";
 		const isSegmentsSource = data.source.type === "desktopSegments";
-		const previousSegmentUploadProgressRef = useRef(segmentUploadProgress);
+		const isOverShareLimit = data.ownerIsOverShareLimit === true;
 		const isActivelyRecording =
 			isSegmentsSource &&
 			(data.hasActiveUpload ?? false) &&
-			!userConfirmedStopped &&
-			(segmentUploadProgress?.status === "fetching" ||
-				segmentUploadProgress?.status === "uploading");
+			isRecordingUpload(segmentUploadProgress, userConfirmedStopped);
 
 		const isProcessingInProgress =
 			isSegmentsSource &&
@@ -352,8 +357,17 @@ export const ShareVideo = forwardRef<
 			setConfirmStoppedError(null);
 
 			try {
-				await finalizeDesktopSegmentsRecording({ videoId: data.id });
+				await finalizeDesktopSegmentsRecording({
+					videoId: data.id,
+				});
 				setUserConfirmedStopped(true);
+				const url = new URL(window.location.href);
+				url.searchParams.set("recordingStopped", "1");
+				window.history.replaceState(
+					window.history.state,
+					"",
+					`${url.pathname}${url.search}${url.hash}`,
+				);
 				router.refresh();
 			} catch (error) {
 				setConfirmStoppedError(
@@ -402,38 +416,6 @@ export const ShareVideo = forwardRef<
 			canFinalizeDesktopSegments &&
 			!userConfirmedStopped &&
 			segmentUploadProgress?.status === "failed";
-		useEffect(() => {
-			if (!isSegmentsSource || !data.hasActiveUpload || !userConfirmedStopped) {
-				previousSegmentUploadProgressRef.current = segmentUploadProgress;
-				return;
-			}
-
-			if (
-				shouldReloadPlaybackAfterUploadCompletes(
-					previousSegmentUploadProgressRef.current,
-					segmentUploadProgress,
-					{ includeFetching: true },
-				) &&
-				!pendingReadyRefreshRef.current
-			) {
-				// Deferred so the player swap never restarts playback mid-view.
-				pendingReadyRefreshRef.current = true;
-				scheduleReadyRefresh({
-					video: videoRef.current,
-					videoId: data.id,
-					refresh: () => router.refresh(),
-				});
-			}
-
-			previousSegmentUploadProgressRef.current = segmentUploadProgress;
-		}, [
-			data.hasActiveUpload,
-			data.id,
-			isSegmentsSource,
-			router,
-			segmentUploadProgress,
-			userConfirmedStopped,
-		]);
 
 		// After the deferred ready-refresh swaps the live HLS player for the MP4
 		// player, resume where the viewer left off instead of restarting.
@@ -526,6 +508,7 @@ export const ShareVideo = forwardRef<
 								hasActiveUpload={data.hasActiveUpload}
 								isLiveSegments={isSegmentsSource}
 								allowSegmentProbeDuringUpload={true}
+								onSourceComplete={handleSourceComplete}
 								autoplay={true}
 								previewMode="background"
 							/>
@@ -541,6 +524,19 @@ export const ShareVideo = forwardRef<
 						</div>
 					) : isProcessingInProgress ? (
 						<PreparingVideoOverlay className="h-full" />
+					) : isOverShareLimit ? (
+						// Quota gate: the player is never mounted, so the video is not
+						// fetched or playable until the owner upgrades (server recomputes
+						// the flag on the next load). Recording/processing branches above
+						// keep priority so in-flight uploads always finalize.
+						<ShareableLinkLimitOverlay
+							isOwner={viewerIsOwner}
+							onUpgrade={openUpgradeModal}
+							onUpgradeHover={() => {
+								void importUpgradeModal();
+							}}
+							className="h-full"
+						/>
 					) : isMp4Source ? (
 						<CapVideoPlayer
 							videoId={data.id}
@@ -552,6 +548,7 @@ export const ShareVideo = forwardRef<
 							)}
 							videoSrc={videoSrc}
 							rawFallbackSrc={rawFallbackSrc}
+							initialPlaybackUrl={initialPlaybackUrl}
 							duration={data.duration}
 							defaultPlaybackSpeed={defaultPlaybackSpeed}
 							showPlaybackStatusBadge={showPlaybackStatusBadge}
@@ -597,6 +594,7 @@ export const ShareVideo = forwardRef<
 							videoRef={videoRef}
 							hasActiveUpload={data.hasActiveUpload}
 							isLiveSegments={isSegmentsSource}
+							onSourceComplete={handleSourceComplete}
 							allowSegmentProbeDuringUpload={
 								isSegmentsSource && userConfirmedStopped
 							}
@@ -654,7 +652,7 @@ export const ShareVideo = forwardRef<
 					)}
 				</div>
 
-				{!data.owner.isPro && (
+				{!data.owner.isPro && !isOverShareLimit && (
 					<div className="absolute top-4 left-4 z-30">
 						<button
 							type="button"
