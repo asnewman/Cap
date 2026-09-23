@@ -1,5 +1,3 @@
-# syntax=docker.io/docker/dockerfile:1
-
 FROM node:24-alpine AS base
 RUN corepack enable
 
@@ -8,7 +6,9 @@ WORKDIR /app
 COPY . .
 
 RUN corepack enable pnpm
-RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store pnpm i --frozen-lockfile
+# ponytail: --no-frozen instead of --frozen because Cap's main has an
+# overrides/lockfile drift; upgrade path is to regen pnpm-lock.yaml upstream.
+RUN pnpm i --no-frozen-lockfile
 
 ARG NEXT_PUBLIC_DOCKER_BUILD=true
 ENV NEXT_PUBLIC_WEB_URL=http://localhost:3000

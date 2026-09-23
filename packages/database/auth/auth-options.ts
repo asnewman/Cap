@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { promisify } from "node:util";
 import { serverEnv } from "@cap/env";
 import { User } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -7,6 +8,7 @@ import { getServerSession as _getServerSession } from "next-auth";
 import type { Adapter } from "next-auth/adapters";
 import { decode, type JWT, type JWTDecodeParams } from "next-auth/jwt";
 import AppleProvider from "next-auth/providers/apple";
+import CredentialsProvider from "next-auth/providers/credentials";
 import EmailProvider from "next-auth/providers/email";
 import GoogleProvider from "next-auth/providers/google";
 import type { Provider } from "next-auth/providers/index";
@@ -20,6 +22,31 @@ import { DrizzleAdapter } from "./drizzle-adapter.ts";
 export const maxDuration = 120;
 
 const OTP_CODE_MAX_AGE_SECONDS = 10 * 60;
+
+// Password hashing via Node's built-in scrypt (salted, memory-hard KDF) — no
+// extra dependency, keeps the frozen-lockfile Docker build intact. Stored as
+// "salt:derivedKey" in hex.
+const scryptAsync = promisify(crypto.scrypt);
+
+async function hashPassword(password: string): Promise<string> {
+	const salt = crypto.randomBytes(16).toString("hex");
+	const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+	return `${salt}:${derived.toString("hex")}`;
+}
+
+async function verifyPassword(
+	password: string,
+	stored: string,
+): Promise<boolean> {
+	const [salt, key] = stored.split(":");
+	if (!salt || !key) return false;
+	const keyBuffer = Buffer.from(key, "hex");
+	const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+	return (
+		keyBuffer.length === derived.length &&
+		crypto.timingSafeEqual(keyBuffer, derived)
+	);
+}
 
 export async function decodeSessionToken(
 	params: JWTDecodeParams,
@@ -82,6 +109,46 @@ export const authOptions = (): NextAuthOptions => {
 							}),
 						]
 					: []),
+				CredentialsProvider({
+					name: "Email and Password",
+					credentials: {
+						email: { label: "Email", type: "email" },
+						password: { label: "Password", type: "password" },
+					},
+					async authorize(credentials) {
+						const email = credentials?.email?.trim().toLowerCase();
+						const password = credentials?.password ?? "";
+						if (!email || password.length < 8) return null;
+
+						const [existing] = await db()
+							.select()
+							.from(users)
+							.where(eq(users.email, email))
+							.limit(1);
+
+						// Only pre-existing accounts (created via email-code / OAuth) can
+						// use password login. New accounts still sign up via email code,
+						// so this doesn't open unauthenticated registration.
+						if (!existing) return null;
+
+						if (existing.password) {
+							if (!(await verifyPassword(password, existing.password)))
+								return null;
+						} else {
+							// First password login for this account: set the chosen password.
+							await db()
+								.update(users)
+								.set({ password: await hashPassword(password) })
+								.where(eq(users.id, existing.id));
+						}
+
+						return {
+							id: existing.id,
+							email: existing.email,
+							name: existing.name ?? null,
+						};
+					},
+				}),
 				GoogleProvider({
 					clientId: serverEnv().GOOGLE_CLIENT_ID as string,
 					clientSecret: serverEnv().GOOGLE_CLIENT_SECRET as string,

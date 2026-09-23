@@ -82,6 +82,9 @@ export const users = mysqlTable(
 		lastName: varchar("lastName", { length: 255 }),
 		email: varchar("email", { length: 255 }).notNull(),
 		emailVerified: timestamp("emailVerified"),
+		// scrypt hash ("salt:derivedKey" hex) for email+password login; null for
+		// accounts that only use email-code / OAuth. Set on first password login.
+		password: varchar("password", { length: 255 }),
 		image: varchar("image", { length: 255 }).$type<ImageUpload.ImageUrlOrKey>(),
 		stripeCustomerId: varchar("stripeCustomerId", { length: 255 }),
 		stripeSubscriptionId: varchar("stripeSubscriptionId", {
