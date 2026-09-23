@@ -1,3 +1,22 @@
+# ⚠️ FORK NOTICE — read this first
+
+This is **`asnewman/Cap`**, a customized fork of [CapSoftware/cap](https://github.com/CapSoftware/cap) that is **self-hosted in production on Railway**. It is not upstream. `main` is the **live deployment branch**: pushing to `main` auto-builds and deploys the real instance. Treat changes with production care, and preserve the fork's customizations (below) when merging upstream or refactoring.
+
+## Deployment
+- **Host:** Railway, project `cap-selfhost`. The `cap-web` service builds from **this repo's `main`** using `apps/web/Dockerfile` (selected via the service's `RAILWAY_DOCKERFILE_PATH` env var). **Push to `main` → automatic build + deploy.** There is no separate release step.
+- **Services:** `cap-web` (this fork) · `media-server` (`ghcr.io/capsoftware/cap-media-server`, official image) · `MySQL` (Railway managed) · `minio` (S3-compatible storage, **path-style**, `S3_PATH_STYLE=true`).
+- **Config & secrets live in Railway env vars, never in the repo.** Do not hardcode keys or infra values. Transcription uses **AssemblyAI** (`ASSEMBLY_API_KEY`).
+- **Watch a deploy:** `railway logs --build --service cap-web` (build) or `railway logs --service cap-web` (runtime). The app auto-runs DB migrations on boot via `apps/web/instrumentation.node.ts`.
+
+## Fork customizations — do NOT drop these
+- **Email + password login** (upstream has none). A `CredentialsProvider` in `packages/database/auth/auth-options.ts` hashes passwords with Node's built-in `crypto.scrypt` (salted, stored as `salt:hash` in the `users.password` column; migration `0039_add_user_password`). It verifies existing accounts and sets the password on first password login for accounts originally created via email-code/OAuth. The `/login` form has a password field. Upstream's magic-code (OTP) and OAuth/Apple providers still work.
+- **Railway-compatible Dockerfile** (`apps/web/Dockerfile`): the upstream `# syntax=` BuildKit frontend directive and `--mount=type=cache` pnpm mount were removed (Railway's Metal builder rejects them), and install uses `pnpm i --no-frozen-lockfile`. **Do not reintroduce BuildKit-only Dockerfile features** or the Railway build breaks.
+
+## Migration gotcha (critical when adding migrations)
+The live DB recorded the password migration with a far-future `when` timestamp (**`1790000000000`**), which is Drizzle's migration **watermark** — on boot Drizzle only applies journal migrations whose `when` is **greater than the max already recorded**. So **any new migration must have a `_journal.json` `when` greater than `1790000000000`** to actually run on the live DB, otherwise it is silently skipped. After `pnpm db:generate`, bump the new entry's `when` above that value (or apply the migration manually against the DB and insert its `__drizzle_migrations` row; Drizzle's recorded hash is `sha256(raw .sql file)`).
+
+---
+
 # Repository Guidelines
 
 ## Pre-Generation Invariants (read BEFORE writing any code)
