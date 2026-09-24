@@ -15,6 +15,46 @@ This is **`asnewman/Cap`**, a customized fork of [CapSoftware/cap](https://githu
 ## Migration gotcha (when merging upstream)
 Drizzle applies only journal migrations whose `when` is **greater than the max `created_at` already recorded** in the live DB's `__drizzle_migrations` (the "watermark"). A past password migration was once recorded with a future `when`, which pushed the watermark ahead of wall-clock time — so during upstream merges, several historical upstream migrations (authored *before* that timestamp) fell below the watermark and had to be applied to the live DB **by hand** (run their SQL, then `INSERT` a `__drizzle_migrations` row whose `hash` = `sha256(raw .sql file)` and `created_at` = the journal `when`). As of 2026-09-23 the watermark is `1790073970527` and wall-clock `Date.now()` has surpassed it, so **new migrations you generate via `bun run db:generate` (whose `when` = `Date.now()`) apply normally on boot — no special action needed.** The only time to worry: (a) you hand-set an older `when`, or (b) you merge upstream migrations timestamped below the current watermark — then apply those manually as described. Check the watermark with `SELECT MAX(created_at) FROM __drizzle_migrations`.
 
+## Runbook: create a user and add them to an org (production)
+Password login can't create accounts (`authorize` in `auth-options.ts` returns `null` for unknown emails), so pre-provisioned users are inserted directly into the live MySQL. This writes to production; only do it when the user explicitly asks. Expect the auto-mode classifier to block `railway link` / `railway run` until the user approves via `/permissions`.
+
+1. **Connect:** `railway link --project cap-selfhost --environment production --service MySQL`. There is no local DB or `mysql` CLI; run Node scripts with `railway run --service MySQL -- node <script>.mjs` (injects `MYSQL_PUBLIC_URL`). Install the driver in a scratch dir, not the repo: `bun add mysql2@3`.
+2. **Check first (read-only):** if the user hasn't named the organization, ask for it; never guess or default. Confirm no `users` row exists for the email (lowercased), and look up the org id: `SELECT id, name FROM organizations WHERE name LIKE '%<org>%' AND tombstoneAt IS NULL`. If zero or multiple orgs match, ask the user which one before writing anything.
+3. **Insert in one transaction**, mirroring the invited-teammate path of `createUser` in `packages/database/auth/drizzle-adapter.ts` (no personal "My Organization"):
+   - `users`: `id` = 15-char nanoId (alphabet `0123456789abcdefghjkmnpqrstvwxyz`, see `packages/database/helpers.ts`), lowercased `email`, `name` = email local part, `emailVerified = NOW()`, `password` = `hashPassword` format (`<16-byte hex salt>:<scrypt(password, salt, 64) hex>`), `activeOrganizationId` and `defaultOrgId` = org id, `marketingOrigin = 'teammate'`.
+   - `organization_members`: new nanoId `id`, `userId`, `organizationId`, `role = 'member'` (or `'admin'` / `'owner'`), `hasProSeat = false`.
+4. **Verify** by selecting both rows back. This skips the Loops sync and Stripe customer provisioning that normal sign-up does. Tell the user to change the password under **Settings → Account**.
+
+```js
+import crypto from "node:crypto";
+import mysql from "mysql2/promise";
+const [EMAIL, ORG, PASSWORD] = ["user@example.com", "<org id from step 2>", "<password>"];
+const abc = "0123456789abcdefghjkmnpqrstvwxyz";
+const id = () => Array.from(crypto.randomBytes(15), (b) => abc[b % 32]).join("");
+const salt = crypto.randomBytes(16).toString("hex");
+const hash = `${salt}:${crypto.scryptSync(PASSWORD, salt, 64).toString("hex")}`;
+const userId = id();
+const c = await mysql.createConnection(process.env.MYSQL_PUBLIC_URL);
+await c.beginTransaction();
+try {
+	const [dup] = await c.query("SELECT id FROM users WHERE email = ? FOR UPDATE", [EMAIL]);
+	if (dup.length) throw new Error("user already exists");
+	await c.query(
+		"INSERT INTO users (id, email, name, emailVerified, password, activeOrganizationId, defaultOrgId, marketingOrigin) VALUES (?, ?, ?, NOW(), ?, ?, ?, 'teammate')",
+		[userId, EMAIL, EMAIL.split("@")[0], hash, ORG, ORG],
+	);
+	await c.query(
+		"INSERT INTO organization_members (id, userId, organizationId, role, hasProSeat) VALUES (?, ?, ?, 'member', false)",
+		[id(), userId, ORG],
+	);
+	await c.commit();
+} catch (e) {
+	await c.rollback();
+	throw e;
+}
+await c.end();
+```
+
 ---
 
 # Repository Guidelines
