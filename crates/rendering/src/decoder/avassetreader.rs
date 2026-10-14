@@ -3,7 +3,12 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
 };
 
 use cidre::{
@@ -11,7 +16,10 @@ use cidre::{
     cv::{self, pixel_buffer::LockFlags},
 };
 use ffmpeg::{Rational, format};
-use tokio::{runtime::Handle as TokioHandle, sync::oneshot};
+use tokio::{
+    runtime::Handle as TokioHandle,
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
+};
 
 use crate::{DecodedFrame, PixelFormat};
 
@@ -29,13 +37,51 @@ const DECODER_REQUEST_CLUSTER_GAP_FRAMES: u32 = FRAME_CACHE_SIZE as u32 / 2;
 // recordings. Keep the existing temporal cap, but also bound the raw decoded
 // frame data so playback remains viable on memory-constrained devices.
 const MAX_FRAME_CACHE_BYTES: usize = 256 * 1024 * 1024;
+// Sequential readers never revisit frames behind the newest request, so only
+// the newest few are kept: enough for repeated requests and for answering a
+// request inside a pts hole with the frame before it. Each retained frame pins
+// a decoder-owned IOSurface (about 9 MB for a 3K screen).
+const SEQUENTIAL_FRAME_CACHE_SIZE: usize = 8;
+// Paused recordings can contain hundreds of screen/camera pairs. AVAssetReader
+// starts decoding eagerly, so only requested tracks may hold native readers.
+const MAX_ACTIVE_READERS: usize = 16;
+const IDLE_READER_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn reader_capacity() -> &'static Arc<Semaphore> {
+    static CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    CAPACITY.get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_READERS)))
+}
+
+#[derive(Default)]
+struct RequestDirection {
+    highest_frame: Option<u32>,
+    moved_backwards: bool,
+}
+
+impl RequestDirection {
+    fn record_batch(&mut self, first_frame: u32, last_frame: u32) {
+        self.moved_backwards |= self
+            .highest_frame
+            .is_some_and(|highest| first_frame < highest);
+        self.highest_frame = self.highest_frame.max(Some(last_frame));
+    }
+
+    fn frame_cache_limit(&self, sequential_access: bool) -> usize {
+        if sequential_access && !self.moved_backwards {
+            SEQUENTIAL_FRAME_CACHE_SIZE
+        } else {
+            FRAME_CACHE_SIZE
+        }
+    }
+}
 
 fn frame_cache_needs_eviction(
     current_frames: usize,
     current_bytes: usize,
     next_frame_bytes: usize,
+    frame_limit: usize,
 ) -> bool {
-    current_frames >= FRAME_CACHE_SIZE
+    current_frames >= frame_limit
         || current_bytes.saturating_add(next_frame_bytes) > MAX_FRAME_CACHE_BYTES
 }
 
@@ -334,6 +380,7 @@ struct DecoderInstance {
     /// Lives on the instance because the reader vends in pts order between
     /// resets, but request batches may be served by different pool decoders.
     prev_vended: Option<u32>,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl DecoderInstance {
@@ -342,6 +389,7 @@ impl DecoderInstance {
         tokio_handle: TokioHandle,
         start_time: f32,
         keyframe_index: Option<Arc<cap_video_decode::avassetreader::KeyframeIndex>>,
+        permit: OwnedSemaphorePermit,
     ) -> Result<Self, String> {
         Ok(Self {
             inner: cap_video_decode::AVAssetReaderDecoder::new_with_keyframe_index(
@@ -357,6 +405,7 @@ impl DecoderInstance {
             tokio_handle,
             keyframe_index,
             prev_vended: None,
+            _permit: permit,
         })
     }
 
@@ -416,8 +465,12 @@ pub struct AVAssetReaderDecoder {
 }
 
 impl AVAssetReaderDecoder {
-    fn new(path: PathBuf, tokio_handle: TokioHandle) -> Result<Self, String> {
-        let keyframe_index = cap_video_decode::avassetreader::KeyframeIndex::build(&path).ok();
+    fn new(
+        path: PathBuf,
+        tokio_handle: TokioHandle,
+        keyframe_index: Option<Arc<cap_video_decode::avassetreader::KeyframeIndex>>,
+        requested_time: f32,
+    ) -> Result<Self, String> {
         let fps = keyframe_index
             .as_ref()
             .map(|kf| kf.fps() as u32)
@@ -426,7 +479,7 @@ impl AVAssetReaderDecoder {
             .as_ref()
             .map(|kf| kf.duration_secs())
             .unwrap_or(0.0);
-        let keyframe_index_arc = keyframe_index.map(Arc::new);
+        let keyframe_index_arc = keyframe_index;
 
         let config = MultiPositionDecoderConfig {
             path: path.clone(),
@@ -436,14 +489,27 @@ impl AVAssetReaderDecoder {
             duration_secs,
         };
 
-        let pool_manager = DecoderPoolManager::new(config);
+        let mut pool_manager = DecoderPoolManager::new(config);
+
+        let permit = tokio_handle
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    reader_capacity().clone().acquire_owned(),
+                )
+                .await
+            })
+            .map_err(|_| "Timed out waiting for an available video reader".to_string())?
+            .map_err(|error| error.to_string())?;
 
         let primary_instance = DecoderInstance::new(
             path.clone(),
             tokio_handle.clone(),
-            0.0,
+            requested_time,
             keyframe_index_arc.clone(),
+            permit,
         )?;
+        pool_manager.update_decoder_position(0, primary_instance.current_position());
 
         // Linear playback only needs one reader. Additional readers retain
         // AVFoundation state and decoded buffers, so create them only when a
@@ -501,7 +567,16 @@ impl AVAssetReaderDecoder {
                 )
             };
 
-            match DecoderInstance::new(path, tokio_handle, requested_time, keyframe_index) {
+            let Ok(permit) = reader_capacity().clone().try_acquire_owned() else {
+                self.decoders[decoder_idx].reset(requested_time);
+                self.pool_manager.update_decoder_position(
+                    decoder_idx,
+                    self.decoders[decoder_idx].current_position(),
+                );
+                self.active_decoder_idx = decoder_idx;
+                return (decoder_idx, true);
+            };
+            match DecoderInstance::new(path, tokio_handle, requested_time, keyframe_index, permit) {
                 Ok(instance) => {
                     let decoder_idx = self.decoders.len();
                     let position = instance.current_position();
@@ -545,10 +620,13 @@ impl AVAssetReaderDecoder {
         fps: u32,
         rx: mpsc::Receiver<VideoDecoderMessage>,
         ready_tx: oneshot::Sender<Result<DecoderInitResult, String>>,
+        sequential_access: Arc<AtomicBool>,
     ) {
         let handle = tokio::runtime::Handle::current();
 
-        std::thread::spawn(move || Self::run(name, path, fps, rx, ready_tx, handle));
+        std::thread::spawn(move || {
+            Self::run(name, path, fps, rx, ready_tx, handle, sequential_access)
+        });
     }
 
     fn run(
@@ -558,28 +636,42 @@ impl AVAssetReaderDecoder {
         rx: mpsc::Receiver<VideoDecoderMessage>,
         ready_tx: oneshot::Sender<Result<DecoderInitResult, String>>,
         tokio_handle: tokio::runtime::Handle,
+        sequential_access: Arc<AtomicBool>,
     ) {
-        let mut this =
-            match objc2::rc::autoreleasepool(|_| AVAssetReaderDecoder::new(path, tokio_handle)) {
-                Ok(v) => v,
-                Err(e) => {
-                    ready_tx.send(Err(e)).ok();
-                    return;
-                }
-            };
-
-        let video_width = this.decoders[0].inner.width();
-        let video_height = this.decoders[0].inner.height();
+        let dimensions = (|| {
+            let input = format::input(&path).map_err(|error| error.to_string())?;
+            let stream = input
+                .streams()
+                .best(ffmpeg::media::Type::Video)
+                .ok_or_else(|| "No video stream found".to_string())?;
+            let video = ffmpeg::codec::Context::from_parameters(stream.parameters())
+                .and_then(|context| context.decoder().video())
+                .map_err(|error| error.to_string())?;
+            if video.width() == 0 || video.height() == 0 {
+                return Err("Invalid video dimensions".to_string());
+            }
+            Ok((video.width(), video.height()))
+        })();
+        let (width, height) = match dimensions {
+            Ok(dimensions) => dimensions,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        };
+        let mut this = None::<Self>;
+        let mut keyframe_index = None;
 
         let init_result = DecoderInitResult {
-            width: video_width,
-            height: video_height,
+            width,
+            height,
             decoder_type: DecoderType::AVAssetReader,
         };
         ready_tx.send(Ok(init_result)).ok();
 
         let mut cache = BTreeMap::<u32, CachedFrame>::new();
         let mut cache_bytes = 0usize;
+        let mut request_direction = RequestDirection::default();
 
         #[allow(unused)]
         let mut last_active_frame = None::<u32>;
@@ -629,8 +721,23 @@ impl AVAssetReaderDecoder {
                     }
                 }
             } else {
-                let Ok(message) = rx.recv() else {
-                    break;
+                let received = if this.is_some() {
+                    rx.recv_timeout(IDLE_READER_TIMEOUT)
+                } else {
+                    rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                };
+                let message = match received {
+                    Ok(message) => message,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        cache.clear();
+                        cache_bytes = 0;
+                        *last_sent_frame.borrow_mut() = None;
+                        *first_ever_frame.borrow_mut() = None;
+                        gap_hold = None;
+                        this = None;
+                        continue;
+                    }
                 };
                 match message {
                     VideoDecoderMessage::GetFrame(
@@ -683,11 +790,16 @@ impl AVAssetReaderDecoder {
                 deferred_requests.extend(pending_requests.drain(split_index..));
             }
 
-            let is_scrubbing = if let Some(first_req) = pending_requests.first() {
-                this.scrub_detector.record_request(first_req.frame)
-            } else {
-                false
-            };
+            if let (Some(first), Some(last)) = (pending_requests.first(), pending_requests.last()) {
+                request_direction.record_batch(first.frame, last.frame);
+            }
+
+            let is_scrubbing =
+                this.as_mut()
+                    .zip(pending_requests.first())
+                    .is_some_and(|(decoder, request)| {
+                        decoder.scrub_detector.record_request(request.frame)
+                    });
 
             let mut unfulfilled = Vec::with_capacity(pending_requests.len());
             let mut last_sent_data = None;
@@ -753,6 +865,31 @@ impl AVAssetReaderDecoder {
                 .min()
                 .unwrap_or(requested_frame);
 
+            if this.is_none() {
+                if keyframe_index.is_none() {
+                    keyframe_index = cap_video_decode::avassetreader::KeyframeIndex::build(&path)
+                        .ok()
+                        .map(Arc::new);
+                }
+                match Self::new(
+                    path.clone(),
+                    tokio_handle.clone(),
+                    keyframe_index.clone(),
+                    requested_time,
+                ) {
+                    Ok(decoder) => this = Some(decoder),
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to initialize video reader on demand");
+                        continue;
+                    }
+                }
+            }
+            pending_requests.retain(|request| !request.sender.is_closed());
+            if pending_requests.is_empty() {
+                continue;
+            }
+            let this = this.as_mut().expect("Video reader initialized above");
+
             let (decoder_idx, was_reset) = this.select_best_decoder(requested_time, is_scrubbing);
 
             let cache_min = if was_reset {
@@ -777,6 +914,8 @@ impl AVAssetReaderDecoder {
 
             last_active_frame = Some(requested_frame);
 
+            let frame_limit =
+                request_direction.frame_cache_limit(sequential_access.load(Ordering::Relaxed));
             let mut exit = false;
             let mut frames_iterated = 0u32;
             let mut last_decoded_position: Option<f32> = None;
@@ -855,7 +994,12 @@ impl AVAssetReaderDecoder {
                             cache_bytes = cache_bytes.saturating_sub(replaced.byte_len());
                         }
                         while !cache.is_empty()
-                            && frame_cache_needs_eviction(cache.len(), cache_bytes, frame_bytes)
+                            && frame_cache_needs_eviction(
+                                cache.len(),
+                                cache_bytes,
+                                frame_bytes,
+                                frame_limit,
+                            )
                         {
                             if let Some(last_active) = &last_active_frame {
                                 let frame_to_remove = if requested_frame > *last_active {
@@ -1153,10 +1297,64 @@ mod tests {
             FRAME_CACHE_SIZE - 1,
             MAX_FRAME_CACHE_BYTES - 1,
             1,
+            FRAME_CACHE_SIZE,
         ));
-        assert!(frame_cache_needs_eviction(FRAME_CACHE_SIZE, 0, 1));
-        assert!(frame_cache_needs_eviction(1, MAX_FRAME_CACHE_BYTES, 1,));
-        assert!(frame_cache_needs_eviction(1, usize::MAX, 1));
+        assert!(frame_cache_needs_eviction(
+            FRAME_CACHE_SIZE,
+            0,
+            1,
+            FRAME_CACHE_SIZE
+        ));
+        assert!(frame_cache_needs_eviction(
+            1,
+            MAX_FRAME_CACHE_BYTES,
+            1,
+            FRAME_CACHE_SIZE
+        ));
+        assert!(frame_cache_needs_eviction(
+            1,
+            usize::MAX,
+            1,
+            FRAME_CACHE_SIZE
+        ));
+    }
+
+    #[test]
+    fn sequential_access_bounds_the_cache_until_requests_move_backwards() {
+        let mut direction = RequestDirection::default();
+        assert_eq!(direction.frame_cache_limit(false), FRAME_CACHE_SIZE);
+        assert_eq!(
+            direction.frame_cache_limit(true),
+            SEQUENTIAL_FRAME_CACHE_SIZE
+        );
+
+        for (first, last) in [(0, 0), (1, 3), (3, 3), (4, 9), (40, 41)] {
+            direction.record_batch(first, last);
+            assert_eq!(
+                direction.frame_cache_limit(true),
+                SEQUENTIAL_FRAME_CACHE_SIZE
+            );
+            assert_eq!(direction.frame_cache_limit(false), FRAME_CACHE_SIZE);
+        }
+
+        direction.record_batch(38, 38);
+        assert_eq!(direction.frame_cache_limit(true), FRAME_CACHE_SIZE);
+
+        for (first, last) in [(42, 42), (43, 50), (90, 120)] {
+            direction.record_batch(first, last);
+            assert_eq!(direction.frame_cache_limit(true), FRAME_CACHE_SIZE);
+        }
+
+        let limit = RequestDirection::default().frame_cache_limit(true);
+        assert!(limit >= 2);
+        assert!(!frame_cache_needs_eviction(limit - 1, 0, 1, limit));
+        assert!(frame_cache_needs_eviction(limit, 0, 1, limit));
+        assert!(frame_cache_needs_eviction(
+            1,
+            MAX_FRAME_CACHE_BYTES,
+            1,
+            limit
+        ));
     }
 
     #[test]

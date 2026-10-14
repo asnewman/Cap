@@ -351,6 +351,13 @@
 			"when": 1790000000000,
 			"tag": "0049_add_user_password",
 			"breakpoints": true
+		},
+		{
+			"idx": 50,
+			"version": "5",
+			"when": 1790203121737,
+			"tag": "0049_jittery_professor_monster",
+			"breakpoints": true
 		}
 	]
 }
